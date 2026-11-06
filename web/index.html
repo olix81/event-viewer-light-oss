@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: MIT
+     Copyright (C) 2025-2026 Olix -->
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MQTT Event Viewer</title>
+  <link rel="stylesheet" href="assets/example.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>MQTT Event Viewer</h1>
+    <nav><a href="docs.html">Documentazione API</a></nav>
+  </header>
+
+  <main>
+    <section class="status" aria-label="Stato">
+      <div class="card">
+        <span class="label">Versione</span>
+        <span id="info-version" class="value">—</span>
+      </div>
+      <div class="card">
+        <span class="label">Broker / topic</span>
+        <span id="info-broker" class="value">—</span>
+      </div>
+      <div class="card">
+        <span class="label">MQTT</span>
+        <span id="mqtt-status" class="badge badge-unknown">sconosciuto</span>
+      </div>
+      <div class="card">
+        <span class="label">Stream live</span>
+        <span id="sse-status" class="badge badge-unknown">in connessione</span>
+      </div>
+    </section>
+
+    <section aria-label="Eventi">
+      <div class="table-head">
+        <h2>Ultimi eventi</h2>
+        <span id="event-count" class="muted">0 eventi</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Sorgente</th>
+              <th>Tipo</th>
+              <th>ID</th>
+              <th>Descrizione</th>
+            </tr>
+          </thead>
+          <tbody id="events">
+            <tr class="empty"><td colspan="5">Nessun evento ricevuto.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer class="muted">
+    Interfaccia d'esempio minimale (licenza MIT). Sostituisci la cartella <code>web/</code> con la tua UI:
+    vedi la <a href="docs.html">documentazione</a>.
+  </footer>
+
+  <script src="assets/example.js"></script>
+</body>
+</html>

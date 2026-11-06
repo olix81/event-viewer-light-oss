@@ -1,0 +1,19 @@
+# Compilazione (Autotools)
+
+# Prima volta, da un checkout git:
+./autogen.sh
+
+# Build nativa (Linux / WSL), con SQLite:
+./configure
+make
+
+# Build per Windows da Linux/WSL (cross MinGW):
+./configure --host=x86_64-w64-mingw32 CPPFLAGS="-I/path/sysroot/include" LDFLAGS="-L/path/sysroot/lib"
+make
+
+# Opzioni utili:
+#   --disable-sqlite   build senza persistenza
+#   --with-ssl         linka OpenSSL (sconsigliato: OpenSSL 3 non e' compatibile con la GPL-2.0)
+
+# Pulizia:
+make clean

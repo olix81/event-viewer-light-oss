@@ -1,0 +1,17 @@
+viewer-run-5001.log
+viewer-run.log
+viewer-events.db
+viewer.exe
+.history/
+*.o
+app.zip
+*.Po
+autom4te.cache
+config.log
+config.status
+Makefile
+configure~
+viewer
+__pycache__/
+*.pyc
+.env

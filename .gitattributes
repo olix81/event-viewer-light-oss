@@ -1,0 +1,9 @@
+# Gli script Autotools devono avere fine riga LF anche su checkout Windows.
+* text=auto
+configure        text eol=lf
+*.sh             text eol=lf
+*.ac             text eol=lf
+*.am             text eol=lf
+*.in             text eol=lf
+*.m4             text eol=lf
+build-aux/*      text eol=lf

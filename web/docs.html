@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: MIT
+     Copyright (C) 2025-2026 Olix -->
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MQTT Event Viewer — API</title>
+  <link rel="stylesheet" href="assets/example.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>MQTT Event Viewer — Documentazione</h1>
+    <nav><a href="index.html">&larr; Dashboard</a></nav>
+  </header>
+
+  <main class="doc">
+    <p>
+      MQTT Event Viewer si sottoscrive a un topic MQTT, conserva gli eventi ricevuti (in memoria e,
+      opzionalmente, in SQLite) e li espone via HTTP. Questa pagina descrive le API che una
+      interfaccia web può usare.
+    </p>
+
+    <nav class="toc" aria-label="Indice">
+      <ul>
+        <li><a href="#evento">Formato di un evento</a></li>
+        <li><a href="#api">Endpoint HTTP</a></li>
+        <li><a href="#paginazione">Paginazione di <code>/api/events</code></a></li>
+        <li><a href="#sse">Stream live (SSE)</a></li>
+        <li><a href="#config">Configurazione</a></li>
+        <li><a href="#ui">Scrivere la propria interfaccia</a></li>
+      </ul>
+    </nav>
+
+    <h2 id="evento">Formato di un evento</h2>
+    <p>
+      Ogni messaggio MQTT viene salvato come oggetto JSON. Se il payload è JSON valido, i suoi campi
+      noti vengono copiati in <code>event_data</code>; altrimenti <code>event_data</code> è assente.
+    </p>
+<pre><code>{
+  "timestamp": "2026-03-15T10:42:07Z",
+  "event_data": {
+    "src": "master",
+    "id": 102,
+    "type": "FMEAS",
+    "desc": "fine test",
+    "timestamp": 1718030010,
+    "timestamp_iso": "2024-06-10T14:33:30Z",
+    "rule": null,
+    "anc": null,
+    "meas": [ { "amp": 1, "status": 0, "v_open": 34.5, "zones": [ ... ] } ]
+  }
+}</code></pre>
+    <table>
+      <thead><tr><th>Campo</th><th>Descrizione</th></tr></thead>
+      <tbody>
+        <tr><td><code>timestamp</code></td><td>Istante di ricezione da parte del viewer (ISO 8601).</td></tr>
+        <tr><td><code>event_data.src</code></td><td>Sorgente dell'evento (stringa).</td></tr>
+        <tr><td><code>event_data.id</code></td><td>Identificativo numerico assegnato dal mittente.</td></tr>
+        <tr><td><code>event_data.type</code></td><td>Tipo di evento (es. <code>LSTART</code>, <code>FMEAS</code>).</td></tr>
+        <tr><td><code>event_data.desc</code></td><td>Descrizione leggibile.</td></tr>
+        <tr><td><code>event_data.timestamp</code></td><td>Timestamp Unix inviato dal mittente; <code>timestamp_iso</code> è la sua forma ISO.</td></tr>
+        <tr><td><code>event_data.rule</code>, <code>anc</code>, <code>meas</code></td><td>Blocchi strutturati copiati così come arrivano (oggetti, array o <code>null</code>).</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="api">Endpoint HTTP</h2>
+    <p>Tutte le risposte API sono <code>application/json</code>.</p>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Descrizione</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /</code></td><td>File statici serviti dalla cartella <code>web/</code> accanto all'eseguibile.</td></tr>
+        <tr><td><code>GET /api/info</code></td><td>Versione e configurazione: <code>{"version":"0.2.0","mqtt":{"host":"…","port":1883,"topic":"…"},"buffer_limit":8192}</code></td></tr>
+        <tr><td><code>GET /api/status</code></td><td>Stato MQTT: <code>{"connected":true,"last_connected":"…","last_error":""}</code></td></tr>
+        <tr><td><code>GET /api/events</code></td><td>Cronologia paginata, dal più recente (vedi sotto).</td></tr>
+        <tr><td><code>GET /api/events/all</code></td><td>Tutta la cronologia, dal più recente: <code>{"events":[…],"total":N}</code>. Può essere pesante: preferire <code>/api/events</code>.</td></tr>
+        <tr><td><code>GET /stream</code></td><td>Server-Sent Events con gli eventi live.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="paginazione">Paginazione di <code>/api/events</code></h2>
+    <p><code>per_page</code> vale 20 di default, massimo 50. Il formato dipende dalla persistenza.</p>
+
+    <h3>Con SQLite attivo (keyset)</h3>
+    <table>
+      <thead><tr><th>Parametro</th><th>Significato</th></tr></thead>
+      <tbody>
+        <tr><td><code>before_id</code></td><td>Eventi più vecchi di questo id (pagina successiva).</td></tr>
+        <tr><td><code>after_id</code></td><td>Eventi più recenti di questo id (pagina precedente). Ignorato se c'è <code>before_id</code>.</td></tr>
+        <tr><td><code>from_ts</code>, <code>to_ts</code></td><td>Filtro temporale (timestamp Unix, secondi).</td></tr>
+      </tbody>
+    </table>
+<pre><code>{"events":[…],"per_page":20,"has_newer":false,"has_older":true,
+ "first_id":123,"last_id":104,"prev_after_id":0,"next_before_id":104,"total":999}</code></pre>
+    <p>
+      Pagina più vecchia: <code>?before_id=&lt;next_before_id&gt;</code> (se <code>has_older</code>).
+      Pagina più recente: <code>?after_id=&lt;prev_after_id&gt;</code> (se <code>has_newer</code>).
+    </p>
+
+    <h3>Senza SQLite (buffer in memoria)</h3>
+    <p>Parametro <code>page</code> (da 1). Risposta: <code>{"events":[…],"page":1,"per_page":20,"total":N}</code>.</p>
+    <p>Un client che vuole funzionare in entrambi i casi può controllare se la risposta contiene <code>next_before_id</code> o <code>page</code>.</p>
+
+    <h2 id="sse">Stream live (SSE)</h2>
+<pre><code>const source = new EventSource("/stream");
+source.onmessage = (msg) =&gt; {
+  const evt = JSON.parse(msg.data);   // stesso formato di /api/events
+  console.log(evt.event_data?.type, evt.event_data?.desc);
+};</code></pre>
+    <ul>
+      <li>Ogni evento arriva come messaggio <code>data:</code> con il JSON dell'evento.</li>
+      <li>Appena connesso, il client riceve fino a <code>SSE_CACHE_LIMIT</code> eventi già in memoria, dal più vecchio al più recente: se carichi anche la cronologia, deduplica.</li>
+      <li>Il server invia periodicamente commenti <code>: keepalive</code>; <code>EventSource</code> si riconnette da solo se la connessione cade.</li>
+    </ul>
+
+    <h2 id="config">Configurazione</h2>
+    <p>Variabili d'ambiente o file <code>.env</code> nella cartella di lavoro (vedi <code>.env.example</code>).</p>
+    <table>
+      <thead><tr><th>Variabile</th><th>Descrizione</th><th>Default</th></tr></thead>
+      <tbody>
+        <tr><td><code>MQTT_BROKER_HOST</code></td><td>Host del broker</td><td><code>broker.hivemq.com</code></td></tr>
+        <tr><td><code>MQTT_BROKER_PORT</code></td><td>Porta del broker</td><td><code>1883</code></td></tr>
+        <tr><td><code>MQTT_TOPIC</code></td><td>Topic filter (wildcard ammesse)</td><td><code>public/test/topic</code></td></tr>
+        <tr><td><code>MQTT_USERNAME</code> / <code>MQTT_PASSWORD</code></td><td>Credenziali</td><td>vuoto</td></tr>
+        <tr><td><code>MQTT_CLIENT_ID</code></td><td>Client id</td><td>generato</td></tr>
+        <tr><td><code>MQTT_KEEPALIVE</code></td><td>Keepalive (s)</td><td><code>60</code></td></tr>
+        <tr><td><code>EVENT_BUFFER_SIZE</code></td><td>Eventi nel buffer in memoria</td><td><code>8192</code></td></tr>
+        <tr><td><code>HTTP_HOST</code></td><td>Indirizzo di ascolto HTTP (<code>0.0.0.0</code> per la rete)</td><td><code>localhost</code></td></tr>
+        <tr><td><code>PORT</code></td><td>Porta HTTP</td><td><code>5000</code></td></tr>
+        <tr><td><code>EVENT_DB_ENABLED</code></td><td>Persistenza SQLite (<code>1</code>/<code>0</code>)</td><td><code>1</code></td></tr>
+        <tr><td><code>EVENT_DB_PATH</code></td><td>File del database</td><td><code>viewer-events.db</code></td></tr>
+        <tr><td><code>EVENT_DB_MAX_EVENTS</code></td><td>Massimo eventi persistiti (<code>0</code> = illimitato)</td><td><code>5000</code></td></tr>
+        <tr><td><code>EVENT_DB_PURGE_BATCH</code></td><td>Righe eliminate a ogni superamento</td><td><code>250</code></td></tr>
+        <tr><td><code>SSE_CACHE_LIMIT</code></td><td>Eventi reinviati a un nuovo client SSE (<code>0</code> = tutti)</td><td><code>200</code></td></tr>
+        <tr><td><code>LOG_LEVEL</code></td><td><code>OFF</code>, <code>ERROR</code>, <code>WARN</code>, <code>INFO</code>, <code>DEBUG</code></td><td><code>INFO</code></td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="ui">Scrivere la propria interfaccia</h2>
+    <ul>
+      <li>Il server serve qualunque file presente in <code>web/</code>: sostituisci il contenuto della cartella con la tua UI. <code>index.html</code> è la pagina iniziale.</li>
+      <li>
+        Le pagine sono servite con una <em>Content-Security-Policy</em> restrittiva
+        (<code>default-src 'self'; script-src 'self'; style-src 'self'</code>):
+        niente script o stili inline, niente CDN. Metti JS e CSS in file separati dentro <code>web/</code>.
+      </li>
+      <li>Gli header CORS sono disabilitati: la UI deve essere servita dallo stesso server (o dietro lo stesso reverse proxy) delle API.</li>
+      <li>
+        Licenze: il server è GPL-2.0-only; questa interfaccia d'esempio è MIT. Una UI che comunica col server
+        solo via HTTP/JSON è un programma separato e può avere la licenza che preferisci.
+      </li>
+    </ul>
+  </main>
+</body>
+</html>
