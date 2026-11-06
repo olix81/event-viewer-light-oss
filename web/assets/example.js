@@ -16,10 +16,12 @@
   const countLabel = document.getElementById("event-count");
   const seen = new Set();    // chiavi degli eventi gia' mostrati
   let rows = 0;
+  let historyReady = false;  // finche' la cronologia non e' arrivata...
+  const pendingLive = [];    // ...gli eventi live vengono messi da parte qui
 
-  /* All'apertura, /stream reinvia (dal piu' vecchio al piu' recente) fino a
-     SSE_CACHE_LIMIT eventi gia' in memoria: possono coincidere con quelli della
-     cronologia, quindi li riconosciamo con una chiave e li scartiamo. */
+  /* Lo stream e' aperto con ?replay=0 (niente reinvio della cache), ma un
+     evento live arrivato mentre si carica la cronologia puo' comparire in
+     entrambe: lo riconosciamo con una chiave e lo scartiamo. */
   function eventKey(evt) {
     const d = evt.event_data || {};
     return [evt.timestamp, d.src, d.type, d.id, d.timestamp].join("|");
@@ -131,13 +133,19 @@
     }
   }
 
+  function onLiveEvent(evt) {
+    if (historyReady) prependEvent(evt);
+    else pendingLive.push(evt);
+  }
+
   function openStream() {
-    const source = new EventSource("/stream");
+    // replay=0: la cronologia arriva gia' da /api/events.
+    const source = new EventSource("/stream?replay=0");
     source.onopen = function () { setBadge("sse-status", "attivo", "ok"); };
     source.onerror = function () { setBadge("sse-status", "riconnessione...", "warn"); };
     source.onmessage = function (msg) {
       try {
-        prependEvent(JSON.parse(msg.data));
+        onLiveEvent(JSON.parse(msg.data));
       } catch (err) {
         console.warn("Evento SSE non valido", err);
       }
@@ -147,5 +155,11 @@
   loadInfo();
   loadStatus();
   setInterval(loadStatus, STATUS_POLL_MS);
-  loadHistory().then(openStream);
+  // Stream e cronologia partono in parallelo; gli eventi live arrivati nel
+  // frattempo vanno in cima, nell'ordine di arrivo, dopo la cronologia.
+  openStream();
+  loadHistory().finally(function () {
+    historyReady = true;
+    pendingLive.splice(0).forEach(prependEvent);
+  });
 })();

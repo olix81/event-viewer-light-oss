@@ -9,12 +9,19 @@ Il formato segue [Keep a Changelog](https://keepachangelog.com/it-IT/1.1.0/) e i
 - Licenza GPL-2.0 (`LICENSE`) per il server e `THIRD_PARTY_NOTICES.md` con le licenze di Mongoose, cJSON e SQLite.
 - Interfaccia web d'esempio minimale (`web/index.html`, licenza MIT) e documentazione API in HTML (`web/docs.html`).
 - `.env.example` con la configurazione di default.
+- Parametro `replay` su `GET /stream` (`?replay=0` salta il reinvio degli eventi in cache, `?replay=N` lo limita a N).
 - Intestazioni `SPDX-License-Identifier` nei sorgenti del progetto.
 
 ### Changed
 - `configure` non linka più OpenSSL per default (`--with-ssl` per abilitarlo): OpenSSL 3 non è compatibile con la GPL-2.0 e il viewer non usa TLS.
 - Versione in `configure.ac` allineata a 0.2.0; segnalazione bug sulle issue GitHub.
 - README riscritto e allineato all'uso di Mongoose per HTTP e MQTT.
+- SQLite in modalità WAL con `synchronous=NORMAL`: niente fsync a ogni insert e letture HTTP non bloccate dalle scritture MQTT. Rimosso l'indice inutilizzato `idx_events_received_at`.
+- Gli eventi SSE vengono inoltrati subito (`mg_wakeup`) invece di attendere fino a 100 ms il timeout del loop HTTP.
+- La UI d'esempio apre lo stream in parallelo alla cronologia, con `?replay=0`.
+
+### Fixed
+- La UI d'esempio mostrava gli eventi del replay SSE sopra quelli più recenti e, al superamento di 200 righe, scartava proprio gli ultimi eventi.
 
 ## [0.2.0] - 2026-03-15
 ### Added

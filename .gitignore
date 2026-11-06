@@ -15,3 +15,5 @@ viewer
 __pycache__/
 *.pyc
 .env
+viewer-events.db-wal
+viewer-events.db-shm

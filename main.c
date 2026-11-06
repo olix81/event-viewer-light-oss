@@ -284,6 +284,8 @@ struct app_state {
   struct app_mutex status_lock;
   struct app_mutex sse_queue_lock;
   struct mg_connection *mqtt_client;
+  struct mg_mgr *http_mgr;           /* woken via mg_wakeup() by the MQTT thread */
+  unsigned long http_listener_id;    /* target connection for mg_wakeup() */
   struct persistence persistence;
   size_t total_events;
   sqlite3_int64 max_db_id;
@@ -614,14 +616,28 @@ static int persistence_init(struct persistence *persistent, const struct config 
     return -1;
   }
   sqlite3_busy_timeout(persistent->db, 2000);
+  /* WAL lets the HTTP thread read while the MQTT thread writes, and
+     synchronous=NORMAL drops the per-insert fsync (in WAL mode the database
+     stays consistent; at worst the last commits are lost on power failure).  */
+  char *errmsg = NULL;
+  rc = sqlite3_exec(persistent->db,
+                    "PRAGMA journal_mode=WAL;"
+                    "PRAGMA synchronous=NORMAL;",
+                    NULL, NULL, &errmsg);
+  if (rc != SQLITE_OK) {
+    app_log(LOG_LEVEL_WARN, "DB", "PRAGMA WAL non applicato: %s", errmsg ? errmsg : "sconosciuto");
+    sqlite3_free(errmsg);
+    errmsg = NULL;
+  }
+  /* idx_events_received_at was never used by any query and only slowed down
+     inserts and purges: drop it from databases created by older versions.  */
   const char *schema =
       "CREATE TABLE IF NOT EXISTS events ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "received_at TEXT NOT NULL,"
         "event_json TEXT NOT NULL"
       ");"
-      "CREATE INDEX IF NOT EXISTS idx_events_received_at ON events(received_at DESC);";
-  char *errmsg = NULL;
+      "DROP INDEX IF EXISTS idx_events_received_at;";
   rc = sqlite3_exec(persistent->db, schema, NULL, NULL, &errmsg);
   if (rc != SQLITE_OK) {
     app_log(LOG_LEVEL_ERROR, "DB", "Errore inizializzazione schema: %s", errmsg ? errmsg : "sconosciuto");
@@ -963,6 +979,7 @@ static void enqueue_sse_event(struct app_state *state, const char *json) {
   }
   item->json = copy;
   app_mutex_lock(&state->sse_queue_lock);
+  int was_empty = state->sse_head == NULL;
   if (state->sse_tail) {
     state->sse_tail->next = item;
   } else {
@@ -970,12 +987,19 @@ static void enqueue_sse_event(struct app_state *state, const char *json) {
   }
   state->sse_tail = item;
   app_mutex_unlock(&state->sse_queue_lock);
+  /* Interrupt the HTTP thread's mg_mgr_poll() so the event is broadcast right
+     away instead of after the poll timeout.  One wakeup per non-empty queue
+     is enough: the HTTP loop drains everything before sleeping again.  */
+  if (was_empty && state->http_mgr && state->http_listener_id) {
+    mg_wakeup(state->http_mgr, state->http_listener_id, "", 0);
+  }
 }
 
 /* Drain up to a bounded number of queued SSE events, broadcasting them to all
-   active clients.  This function frees queue entries as it goes.  */
-static void flush_sse_queue(struct app_state *state) {
-  if (!state) return;
+   active clients.  This function frees queue entries as it goes and returns
+   nonzero when entries are still queued.  */
+static int flush_sse_queue(struct app_state *state) {
+  if (!state) return 0;
   const size_t max_per_loop = 100;
   size_t processed = 0;
   while (processed < max_per_loop) {
@@ -992,6 +1016,10 @@ static void flush_sse_queue(struct app_state *state) {
     free(item);
     processed++;
   }
+  app_mutex_lock(&state->sse_queue_lock);
+  int remaining = state->sse_head != NULL;
+  app_mutex_unlock(&state->sse_queue_lock);
+  return remaining;
 }
 
 /* Return the cached total number of events tracked by state.  The value is
@@ -1441,9 +1469,12 @@ static int uri_is(struct mg_http_message *hm, const char *target) {
 }
 
 /* Stream up to sse_cache_limit recent events over c right after an SSE client
-   connects, helping the UI display immediate history.  */
-static void sse_send_cached_events(struct app_state *state, struct mg_connection *c) {
-  if (!state || !c) return;
+   connects, helping the UI display immediate history.  A positive requested
+   value (the ?replay=N query parameter) lowers that limit further; negative
+   means "use the configured limit".  */
+static void sse_send_cached_events(struct app_state *state, struct mg_connection *c,
+                                   int requested) {
+  if (!state || !c || requested == 0) return;
   state_data_lock(state);
   if (state->store.count == 0) {
     state_data_unlock(state);
@@ -1452,6 +1483,7 @@ static void sse_send_cached_events(struct app_state *state, struct mg_connection
   size_t to_send = state->store.count;
   size_t limit =
       state->cfg.sse_cache_limit > 0 ? (size_t)state->cfg.sse_cache_limit : state->store.count;
+  if (requested > 0 && (size_t)requested < limit) limit = (size_t)requested;
   if (limit > 0 && to_send > limit) to_send = limit;
   app_log(LOG_LEVEL_DEBUG, "SSE", "Invio %zu eventi cached al nuovo client (limit %d)", to_send,
           state->cfg.sse_cache_limit);
@@ -1510,7 +1542,9 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data) {
         const char *hello = ": connected\n\n";
         mg_http_write_chunk(c, hello, strlen(hello));
         add_sse_client(state, c);
-        sse_send_cached_events(state, c);
+        /* ?replay=0 skips the cached replay (clients that already load the
+           history from /api/events); ?replay=N caps it to N events.  */
+        sse_send_cached_events(state, c, query_param_int(hm, "replay", -1));
       } else {
         mg_http_serve_dir(c, hm, &opts);
       }
@@ -1736,6 +1770,13 @@ int main(void) {
   }
   http_conn->fn_data = &state;
   app_log(LOG_LEVEL_INFO, "HTTP", "Listening on %s", http_addr);
+  /* Must be ready before the MQTT thread starts calling enqueue_sse_event().  */
+  if (mg_wakeup_init(&http_mgr)) {
+    state.http_mgr = &http_mgr;
+    state.http_listener_id = http_conn->id;
+  } else {
+    app_log(LOG_LEVEL_WARN, "HTTP", "mg_wakeup non disponibile: eventi SSE inoltrati entro 100 ms");
+  }
 
   log_startup_step(4, "preparazione MQTT e avvio worker");
 
@@ -1758,9 +1799,11 @@ int main(void) {
   app_log(LOG_LEVEL_INFO, "APP", "Avvio completato: HTTP %s, sottoscrizione %s", http_addr, state.cfg.topic);
   struct mg_timer ping_timer;
   mg_timer_init(&http_mgr.timers, &ping_timer, 5000, MG_TIMER_REPEAT, send_sse_ping, &state);
+  int sse_backlog = 0;
   for (;;) {
-    mg_mgr_poll(&http_mgr, 100);
-    flush_sse_queue(&state);
+    /* Don't sleep while SSE events are still queued after a bounded flush.  */
+    mg_mgr_poll(&http_mgr, sse_backlog ? 0 : 100);
+    sse_backlog = flush_sse_queue(&state);
   }
 
   event_store_free(&state.store);

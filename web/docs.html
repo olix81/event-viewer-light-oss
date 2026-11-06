@@ -110,6 +110,7 @@ source.onmessage = (msg) =&gt; {
     <ul>
       <li>Ogni evento arriva come messaggio <code>data:</code> con il JSON dell'evento.</li>
       <li>Appena connesso, il client riceve fino a <code>SSE_CACHE_LIMIT</code> eventi già in memoria, dal più vecchio al più recente: se carichi anche la cronologia, deduplica.</li>
+      <li>Parametro <code>replay</code>: <code>/stream?replay=0</code> salta il reinvio (consigliato se carichi la cronologia da <code>/api/events</code>); <code>?replay=N</code> lo limita a N eventi, sempre entro <code>SSE_CACHE_LIMIT</code>.</li>
       <li>Il server invia periodicamente commenti <code>: keepalive</code>; <code>EventSource</code> si riconnette da solo se la connessione cade.</li>
     </ul>
 
