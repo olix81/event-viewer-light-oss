@@ -6,7 +6,7 @@ Applicazione C standalone che si sottoscrive a un topic MQTT ed espone una dashb
 - **[cJSON](https://github.com/DaveGamble/cJSON)** si occupa del parsing JSON.
 - **SQLite** (opzionale) persiste gli eventi su disco.
 
-Mongoose e cJSON sono inclusi nel repository (`mongoose.c/.h`, `cJSON.c/.h`): l'unica dipendenza esterna della build è SQLite. Il binario serve i file statici leggendo a runtime la cartella `web/`, che deve quindi trovarsi accanto all'eseguibile.
+Mongoose e cJSON sono inclusi nel repository (`mongoose.c/.h`, `cJSON.c/.h`): l'unica dipendenza esterna della build è SQLite. Il binario serve i file statici dalla cartella indicata da `WEB_ROOT` (default `web/`).
 
 La cartella `web/` contiene una **interfaccia d'esempio minimale** e la **documentazione delle API** ([`web/docs.html`](web/docs.html)), raggiungibile anche dal server su `http://localhost:5000/docs.html`. Puoi sostituirla con la tua interfaccia.
 
@@ -61,7 +61,7 @@ Esempi di cross-compilazione:
 .\viewer.exe
 ```
 
-Il server ascolta su `http://localhost:5000` (modificabile con `HTTP_HOST` e `PORT`; usa `HTTP_HOST=0.0.0.0` per accettare connessioni da altre macchine).
+Il server ascolta su `http://localhost:5000` (modificabile con `HTTP_HOST` e `PORT`; usa `HTTP_HOST=0.0.0.0` per accettare connessioni da altre macchine). `WEB_ROOT` seleziona la cartella dell'interfaccia, anche tramite percorso assoluto.
 
 Aprendo `http://localhost:5000`, la pagina d'esempio mostra versione, broker e stato MQTT (`/api/info`, `/api/status`). Carica poi gli ultimi 20 eventi da `/api/events` e aggiunge quelli nuovi in tempo reale via SSE (`/stream`).
 
@@ -84,6 +84,7 @@ Variabili d'ambiente, oppure voci nel file `.env` (caricato automaticamente all'
 | `EVENT_BUFFER_SIZE` | Numero massimo di eventi nel buffer in memoria | `8192` |
 | `HTTP_HOST` | Indirizzo su cui ascolta il server HTTP | `localhost` |
 | `PORT` | Porta HTTP | `5000` |
+| `WEB_ROOT` | Cartella dei file statici (percorso relativo o assoluto) | `web` |
 | `EVENT_DB_ENABLED` | Abilita (`1`) o disabilita (`0`) la persistenza SQLite | `1` |
 | `EVENT_DB_PATH` | Percorso del database SQLite | `viewer-events.db` |
 | `EVENT_DB_MAX_EVENTS` | Numero massimo di eventi persistiti (`0` = illimitato) | `5000` |
@@ -93,11 +94,16 @@ Variabili d'ambiente, oppure voci nel file `.env` (caricato automaticamente all'
 
 In produzione conviene `LOG_LEVEL=WARN` o `ERROR`; `DEBUG` solo per il troubleshooting.
 
+La coda live SSE è limitata a 1024 eventi o 8 MiB. Se il limite viene superato,
+il server scarta la coda incompleta e chiude gli stream attivi: `EventSource` si
+riconnette e riceve il replay recente. Anche l'output in attesa per ciascun
+client SSE è limitato a 4 MiB; i client troppo lenti vengono disconnessi.
+
 ## Endpoint HTTP
 
 | Endpoint | Descrizione |
 | --- | --- |
-| `GET /` | Dashboard statica (file serviti da `web/`). |
+| `GET /` | Dashboard statica (file serviti dalla cartella `WEB_ROOT`, default `web/`). |
 | `GET /api/info` | Versione applicativa, broker/topic, dimensione buffer. |
 | `GET /api/events` | Cronologia paginata (vedi sotto). |
 | `GET /api/events/all` | Intera cronologia, dalla più recente: `{"events":[...],"total":N}`. Pensato per tool esterni. |
@@ -139,6 +145,7 @@ CREATE TABLE events (
 - All'avvio vengono precaricati nel buffer in memoria fino a `EVENT_BUFFER_SIZE` eventi recenti, così la dashboard mostra subito lo storico.
 - `/api/events` e `/api/events/all` leggono dal database; senza persistenza usano il buffer in memoria (che si azzera al riavvio).
 - Lo stream SSE gestisce solo gli aggiornamenti live. Per evitare blocchi alla riconnessione del browser, a un nuovo client vengono inviati al massimo `SSE_CACHE_LIMIT` eventi.
+- Per recuperare gli eventi recenti dopo una disconnessione dovuta a sovraccarico, non usare `replay=0`; il client d'esempio usa il replay predefinito.
 
 ## Versioning
 
@@ -148,7 +155,7 @@ CREATE TABLE events (
 ## Utility
 
 - `sample-events.jsonl` — 6 eventi d'esempio (un ciclo di test completo: `LSTART`, `LMREQ`, tre `FMEAS` con blocchi di misura, `LEND`), uno per riga.
-- `publish_samples.py` — ripubblica i campioni su un broker (default `broker.hivemq.com`, topic `public/test/topic`) con ritmo configurabile (`--delay 4`) e ripartenza da un ID specifico (`--start-id 1911110500`).
+- `publish_samples.py` — ripubblica i campioni su un broker (default `broker.hivemq.com`, topic `public/test/topic`) con ritmo configurabile (`--delay 4`) e ripartenza da un ID specifico (`--start-id 1911110500`); attende l'invio di ogni messaggio e segnala errori o timeout.
 - `publish_single_event.py` — pubblica un singolo evento di test.
 
 ## Licenza
@@ -168,7 +175,7 @@ Le licenze dei componenti di terze parti (Mongoose, cJSON, SQLite) sono riportat
 
 Lo zip di release deve contenere:
 - `viewer.exe`;
-- la cartella `web/`, che il server legge a runtime;
+- la cartella configurata in `WEB_ROOT` (default `web/`), che il server legge a runtime;
 - `LICENSE`, `web/LICENSE` e `THIRD_PARTY_NOTICES.md`.
 
 Per la parte GPL va inoltre reso disponibile il sorgente corrispondente al binario, per esempio con il link al repository e al tag della release. Non distribuire build linkate con OpenSSL 3 (`./configure --with-ssl`): la sua licenza non è compatibile con la GPL-2.0.

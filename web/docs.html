@@ -69,7 +69,7 @@
     <table>
       <thead><tr><th>Endpoint</th><th>Descrizione</th></tr></thead>
       <tbody>
-        <tr><td><code>GET /</code></td><td>File statici serviti dalla cartella <code>web/</code> accanto all'eseguibile.</td></tr>
+        <tr><td><code>GET /</code></td><td>File statici serviti dalla cartella <code>WEB_ROOT</code> (default <code>web/</code>).</td></tr>
         <tr><td><code>GET /api/info</code></td><td>Versione e configurazione: <code>{"version":"0.2.0","mqtt":{"host":"…","port":1883,"topic":"…"},"buffer_limit":8192}</code></td></tr>
         <tr><td><code>GET /api/status</code></td><td>Stato MQTT: <code>{"connected":true,"last_connected":"…","last_error":""}</code></td></tr>
         <tr><td><code>GET /api/events</code></td><td>Cronologia paginata, dal più recente (vedi sotto).</td></tr>
@@ -110,7 +110,8 @@ source.onmessage = (msg) =&gt; {
     <ul>
       <li>Ogni evento arriva come messaggio <code>data:</code> con il JSON dell'evento.</li>
       <li>Appena connesso, il client riceve fino a <code>SSE_CACHE_LIMIT</code> eventi già in memoria, dal più vecchio al più recente: se carichi anche la cronologia, deduplica.</li>
-      <li>Parametro <code>replay</code>: <code>/stream?replay=0</code> salta il reinvio (consigliato se carichi la cronologia da <code>/api/events</code>); <code>?replay=N</code> lo limita a N eventi, sempre entro <code>SSE_CACHE_LIMIT</code>.</li>
+      <li>Parametro <code>replay</code>: <code>/stream?replay=0</code> salta il reinvio; <code>?replay=N</code> lo limita a N eventi, sempre entro <code>SSE_CACHE_LIMIT</code>. Il replay predefinito è utile per recuperare gli eventi recenti dopo una riconnessione.</li>
+      <li>La coda live è limitata a 1024 eventi o 8 MiB e l'output in attesa per client a 4 MiB. In caso di sovraccarico gli stream vengono chiusi per consentire la riconnessione e il replay; i client lenti vengono disconnessi.</li>
       <li>Il server invia periodicamente commenti <code>: keepalive</code>; <code>EventSource</code> si riconnette da solo se la connessione cade.</li>
     </ul>
 
@@ -139,7 +140,7 @@ source.onmessage = (msg) =&gt; {
 
     <h2 id="ui">Scrivere la propria interfaccia</h2>
     <ul>
-      <li>Il server serve qualunque file presente in <code>web/</code>: sostituisci il contenuto della cartella con la tua UI. <code>index.html</code> è la pagina iniziale.</li>
+      <li>Il server serve qualunque file presente in <code>WEB_ROOT</code> (default <code>web/</code>): puoi indicare una cartella diversa nelle variabili d'ambiente o nel file <code>.env</code>. <code>index.html</code> è la pagina iniziale.</li>
       <li>
         Le pagine sono servite con una <em>Content-Security-Policy</em> restrittiva
         (<code>default-src 'self'; script-src 'self'; style-src 'self'</code>):

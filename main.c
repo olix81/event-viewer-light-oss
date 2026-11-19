@@ -132,6 +132,10 @@ static enum log_level parse_log_level(const char *value) {
 #define EVENTS_DEFAULT_PER_PAGE 20
 #define EVENTS_MAX_PER_PAGE 50
 #define DEFAULT_SSE_CACHE_LIMIT 200
+#define SSE_QUEUE_MAX_EVENTS 1024
+#define SSE_QUEUE_MAX_BYTES (8U * 1024U * 1024U)
+#define SSE_CLIENT_MAX_PENDING_BYTES (4U * 1024U * 1024U)
+#define SSE_CHUNK_OVERHEAD 32U
 
 struct config {
   char broker_host[256];
@@ -144,6 +148,7 @@ struct config {
   int event_buffer;
   int http_port;
   char http_host[64];
+  char web_root[512];
   char db_path[260];
   int db_enabled;
   int db_max_events;
@@ -215,6 +220,7 @@ struct sse_client {
 
 struct sse_pending {
   char *json;
+  size_t json_len;
   struct sse_pending *next;
 };
 
@@ -280,6 +286,10 @@ struct app_state {
   struct sse_client *sse_clients;
   struct sse_pending *sse_head;
   struct sse_pending *sse_tail;
+  size_t sse_queue_events;
+  size_t sse_queue_bytes;
+  size_t sse_overflow_dropped;
+  int sse_overflow;
   struct app_mutex data_lock;
   struct app_mutex status_lock;
   struct app_mutex sse_queue_lock;
@@ -467,6 +477,9 @@ static void config_load(struct config *cfg) {
   env = get_env("HTTP_HOST", "localhost", &overridden);
   snprintf(cfg->http_host, sizeof(cfg->http_host), "%s", env);
   if (overridden) log_config_override_str("HTTP_HOST", cfg->http_host, 0);
+  env = get_env("WEB_ROOT", "web", &overridden);
+  snprintf(cfg->web_root, sizeof(cfg->web_root), "%s", env);
+  if (overridden) log_config_override_str("WEB_ROOT", cfg->web_root, 0);
   env = get_env("PORT", "5000", &overridden);
   cfg->http_port = atoi(env);
   if (cfg->http_port <= 0) cfg->http_port = DEFAULT_HTTP_PORT;
@@ -801,7 +814,10 @@ static int persistence_fetch_page(struct persistence *persistent, int per_page,
                                   sqlite3_int64 before_id, sqlite3_int64 after_id,
                                   sqlite3_int64 from_ts, sqlite3_int64 to_ts,
                                   struct events_page *page) {
-  // Keyset pagination plus optional UTC timestamp window.
+  // Keyset pagination plus optional UTC timestamp window.  With after_id the
+  // rows are read in ascending order, so the page holds the events right after
+  // after_id (not the newest ones); they are reversed below to keep the usual
+  // newest-first output.
   if (!persistent || !persistent->enabled || !persistent->db || !page) return 0;
   memset(page, 0, sizeof(*page));
   if (per_page <= 0) return 0;
@@ -818,12 +834,12 @@ static int persistence_fetch_page(struct persistence *persistent, int per_page,
           "FROM events WHERE id > ?1 "
           "AND (?3 = 0 OR json_extract(event_json,'$.event_data.timestamp') >= ?3) "
           "AND (?4 = 0 OR json_extract(event_json,'$.event_data.timestamp') <= ?4) "
-          "ORDER BY id DESC LIMIT ?2";
+          "ORDER BY id ASC LIMIT ?2";
     } else {
       sql =
           "SELECT id, event_json, NULL AS evt_ts "
           "FROM events WHERE id > ?1 "
-          "ORDER BY id DESC LIMIT ?2";
+          "ORDER BY id ASC LIMIT ?2";
     }
     param = after_id;
   } else {
@@ -887,27 +903,50 @@ static int persistence_fetch_page(struct persistence *persistent, int per_page,
     page->timestamps[page->count - 1] = 0;
     page->count--;
   }
+  if (after_id > 0) {
+    for (size_t i = 0, j = page->count; i + 1 < j; ++i, --j) {
+      char *row = page->rows[i];
+      page->rows[i] = page->rows[j - 1];
+      page->rows[j - 1] = row;
+      sqlite3_int64 id = page->ids[i];
+      page->ids[i] = page->ids[j - 1];
+      page->ids[j - 1] = id;
+      sqlite3_int64 ts = page->timestamps[i];
+      page->timestamps[i] = page->timestamps[j - 1];
+      page->timestamps[j - 1] = ts;
+    }
+  }
   return 1;
 }
 
-/* Return nonzero when the SQLite store contains rows newer than
-   greater_than_id and within the optional timestamp bounds.  */
-static int persistence_has_newer_than(struct persistence *persistent, sqlite3_int64 greater_than_id,
-                                      sqlite3_int64 from_ts, sqlite3_int64 to_ts) {
+/* Return nonzero when the SQLite store contains rows newer (newer != 0) or
+   older (newer == 0) than id and within the optional timestamp bounds.  */
+static int persistence_has_beyond(struct persistence *persistent, sqlite3_int64 id, int newer,
+                                  sqlite3_int64 from_ts, sqlite3_int64 to_ts) {
   if (!persistent || !persistent->enabled || !persistent->db) return 0;
   int use_time_filter = (from_ts > 0 || to_ts > 0);
-  const char *sql = use_time_filter
-                        ? "SELECT 1 FROM events WHERE id > ?1 "
-                          "AND (?2 = 0 OR json_extract(event_json,'$.event_data.timestamp') >= ?2) "
-                          "AND (?3 = 0 OR json_extract(event_json,'$.event_data.timestamp') <= ?3) "
-                          "LIMIT 1"
-                        : "SELECT 1 FROM events WHERE id > ?1 LIMIT 1";
+  const char *sql;
+  if (newer) {
+    sql = use_time_filter
+              ? "SELECT 1 FROM events WHERE id > ?1 "
+                "AND (?2 = 0 OR json_extract(event_json,'$.event_data.timestamp') >= ?2) "
+                "AND (?3 = 0 OR json_extract(event_json,'$.event_data.timestamp') <= ?3) "
+                "LIMIT 1"
+              : "SELECT 1 FROM events WHERE id > ?1 LIMIT 1";
+  } else {
+    sql = use_time_filter
+              ? "SELECT 1 FROM events WHERE id < ?1 "
+                "AND (?2 = 0 OR json_extract(event_json,'$.event_data.timestamp') >= ?2) "
+                "AND (?3 = 0 OR json_extract(event_json,'$.event_data.timestamp') <= ?3) "
+                "LIMIT 1"
+              : "SELECT 1 FROM events WHERE id < ?1 LIMIT 1";
+  }
   sqlite3_stmt *stmt = NULL;
   if (sqlite3_prepare_v2(persistent->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
     if (stmt) sqlite3_finalize(stmt);
     return 0;
   }
-  sqlite3_bind_int64(stmt, 1, greater_than_id);
+  sqlite3_bind_int64(stmt, 1, id);
   if (use_time_filter) {
     sqlite3_bind_int64(stmt, 2, from_ts);
     sqlite3_bind_int64(stmt, 3, to_ts);
@@ -970,6 +1009,14 @@ static char *duplicate_json_string(const char *text) {
    copied string passes to the queue item.  */
 static void enqueue_sse_event(struct app_state *state, const char *json) {
   if (!state || !json) return;
+  app_mutex_lock(&state->sse_queue_lock);
+  if (state->sse_overflow) {
+    state->sse_overflow_dropped++;
+    app_mutex_unlock(&state->sse_queue_lock);
+    return;
+  }
+  app_mutex_unlock(&state->sse_queue_lock);
+
   char *copy = duplicate_json_string(json);
   if (!copy) return;
   struct sse_pending *item = (struct sse_pending *)calloc(1, sizeof(struct sse_pending));
@@ -978,15 +1025,39 @@ static void enqueue_sse_event(struct app_state *state, const char *json) {
     return;
   }
   item->json = copy;
+  item->json_len = strlen(copy);
   app_mutex_lock(&state->sse_queue_lock);
   int was_empty = state->sse_head == NULL;
-  if (state->sse_tail) {
-    state->sse_tail->next = item;
+  int overflow = state->sse_overflow;
+  if (overflow) {
+    state->sse_overflow_dropped++;
+  } else if (state->sse_queue_events >= SSE_QUEUE_MAX_EVENTS ||
+             state->sse_queue_bytes > SSE_QUEUE_MAX_BYTES ||
+             item->json_len > SSE_QUEUE_MAX_BYTES - state->sse_queue_bytes) {
+    state->sse_overflow = 1;
+    state->sse_overflow_dropped = state->sse_queue_events + 1;
+    overflow = 1;
   } else {
-    state->sse_head = item;
+    if (state->sse_tail) {
+      state->sse_tail->next = item;
+    } else {
+      state->sse_head = item;
+    }
+    state->sse_tail = item;
+    state->sse_queue_events++;
+    state->sse_queue_bytes += item->json_len;
   }
-  state->sse_tail = item;
   app_mutex_unlock(&state->sse_queue_lock);
+  if (overflow) {
+    free(item->json);
+    free(item);
+    /* Wake even when the queue was already non-empty: the HTTP thread must
+       promptly close streams and discard the now-incomplete live backlog. */
+    if (state->http_mgr && state->http_listener_id) {
+      mg_wakeup(state->http_mgr, state->http_listener_id, "", 0);
+    }
+    return;
+  }
   /* Interrupt the HTTP thread's mg_mgr_poll() so the event is broadcast right
      away instead of after the poll timeout.  One wakeup per non-empty queue
      is enough: the HTTP loop drains everything before sleeping again.  */
@@ -1000,14 +1071,51 @@ static void enqueue_sse_event(struct app_state *state, const char *json) {
    nonzero when entries are still queued.  */
 static int flush_sse_queue(struct app_state *state) {
   if (!state) return 0;
+  app_mutex_lock(&state->sse_queue_lock);
+  int overflow = state->sse_overflow;
+  struct sse_pending *discard = NULL;
+  size_t dropped = 0;
+  if (overflow) {
+    discard = state->sse_head;
+    state->sse_head = NULL;
+    state->sse_tail = NULL;
+    state->sse_queue_events = 0;
+    state->sse_queue_bytes = 0;
+    dropped = state->sse_overflow_dropped;
+    state->sse_overflow_dropped = 0;
+    state->sse_overflow = 0;
+  }
+  app_mutex_unlock(&state->sse_queue_lock);
+  if (overflow) {
+    while (discard) {
+      struct sse_pending *next = discard->next;
+      free(discard->json);
+      free(discard);
+      discard = next;
+    }
+    for (struct sse_client *client = state->sse_clients; client; client = client->next) {
+      if (client->conn && !client->conn->is_closing) client->conn->is_closing = 1;
+    }
+    app_log(LOG_LEVEL_WARN, "SSE",
+            "Coda live oltre il limite; chiusi gli stream per riconnessione (eventi non inoltrati: %zu)",
+            dropped);
+    return 0;
+  }
+
   const size_t max_per_loop = 100;
   size_t processed = 0;
   while (processed < max_per_loop) {
     app_mutex_lock(&state->sse_queue_lock);
+    if (state->sse_overflow) {
+      app_mutex_unlock(&state->sse_queue_lock);
+      break;
+    }
     struct sse_pending *item = state->sse_head;
     if (item) {
       state->sse_head = item->next;
       if (state->sse_head == NULL) state->sse_tail = NULL;
+      state->sse_queue_events--;
+      state->sse_queue_bytes -= item->json_len;
     }
     app_mutex_unlock(&state->sse_queue_lock);
     if (!item) break;
@@ -1017,7 +1125,7 @@ static int flush_sse_queue(struct app_state *state) {
     processed++;
   }
   app_mutex_lock(&state->sse_queue_lock);
-  int remaining = state->sse_head != NULL;
+  int remaining = state->sse_head != NULL || state->sse_overflow;
   app_mutex_unlock(&state->sse_queue_lock);
   return remaining;
 }
@@ -1127,25 +1235,55 @@ static void process_mqtt_message(struct app_state *state, const char *topic, con
   }
 }
 
+static int sse_client_would_exceed(const struct mg_connection *conn, size_t payload_len) {
+  if (!conn || conn->send.len > SSE_CLIENT_MAX_PENDING_BYTES) return 1;
+  size_t available = SSE_CLIENT_MAX_PENDING_BYTES - conn->send.len;
+  return available < SSE_CHUNK_OVERHEAD || payload_len > available - SSE_CHUNK_OVERHEAD;
+}
+
 /* Write the JSON payload specified by json to every connected SSE client
    stored in state while cleaning up dead connections.  */
 static void broadcast_sse(struct app_state *state, const char *json) {
+  if (!state || !json) return;
   struct sse_client **client = &state->sse_clients;
   size_t delivered = 0;
   static uint64_t last_no_client_warn_ms = 0;
+  size_t json_len = strlen(json);
+  if (json_len > SIZE_MAX - 8) return;
+  size_t frame_len = json_len + 8;
+  char *frame = NULL;
   while (*client) {
     struct sse_client *curr = *client;
     if (curr->conn->is_closing) {
       *client = curr->next;
       free(curr);
     } else {
-      mg_http_write_chunk(curr->conn, "data: ", 6);
-      mg_http_write_chunk(curr->conn, json, strlen(json));
-      mg_http_write_chunk(curr->conn, "\n\n", 2);
-      delivered++;
+      if (sse_client_would_exceed(curr->conn, frame_len)) {
+        app_log(LOG_LEVEL_WARN, "SSE",
+                "Client %lu disconnesso per arretrato oltre %u byte",
+                curr->conn->id, (unsigned)SSE_CLIENT_MAX_PENDING_BYTES);
+        curr->conn->is_closing = 1;
+      } else {
+        if (!frame) {
+          frame = (char *)malloc(frame_len);
+          if (!frame) {
+            app_log(LOG_LEVEL_ERROR, "SSE", "Memoria insufficiente per inoltrare un evento live");
+            for (struct sse_client *active = state->sse_clients; active; active = active->next) {
+              if (active->conn && !active->conn->is_closing) active->conn->is_closing = 1;
+            }
+            break;
+          }
+          memcpy(frame, "data: ", 6);
+          memcpy(frame + 6, json, json_len);
+          memcpy(frame + 6 + json_len, "\n\n", 2);
+        }
+        mg_http_write_chunk(curr->conn, frame, frame_len);
+        delivered++;
+      }
       client = &curr->next;
     }
   }
+  free(frame);
   if (delivered == 0) {
     uint64_t now_ms = mg_millis();
     if (now_ms - last_no_client_warn_ms >= 10000) {
@@ -1171,7 +1309,15 @@ static void send_sse_ping(void *arg) {
       *client = curr->next;
       free(curr);
     } else {
-      mg_http_write_chunk(curr->conn, ping, strlen(ping));
+      size_t ping_len = strlen(ping);
+      if (sse_client_would_exceed(curr->conn, ping_len)) {
+        app_log(LOG_LEVEL_WARN, "SSE",
+                "Client %lu disconnesso per arretrato oltre %u byte",
+                curr->conn->id, (unsigned)SSE_CLIENT_MAX_PENDING_BYTES);
+        curr->conn->is_closing = 1;
+      } else {
+        mg_http_write_chunk(curr->conn, ping, ping_len);
+      }
       client = &curr->next;
     }
   }
@@ -1314,12 +1460,21 @@ static void send_events_json(struct app_state *state, struct mg_connection *c,
     }
     sqlite3_int64 first_id = page.count ? page.ids[0] : 0;
     sqlite3_int64 last_id = page.count ? page.ids[page.count - 1] : 0;
-    // We grab one extra row to know if "older" pages exist; "newer" requires a lookup.
-    int has_older = page.trimmed_extra ? 1 : 0;
-    int has_newer =
-        (after_id > 0 && page.count)
-            ? persistence_has_newer_than(&state->persistence, first_id, from_ts, to_ts)
-            : 0;
+    // One extra row is fetched in the paging direction (older with before_id,
+    // newer with after_id); the opposite direction needs a lookup.
+    int has_older = 0;
+    int has_newer = 0;
+    if (after_id > 0) {
+      has_newer = page.trimmed_extra ? 1 : 0;
+      has_older = page.count
+                      ? persistence_has_beyond(&state->persistence, last_id, 0, from_ts, to_ts)
+                      : 0;
+    } else {
+      has_older = page.trimmed_extra ? 1 : 0;
+      has_newer = page.count
+                      ? persistence_has_beyond(&state->persistence, first_id, 1, from_ts, to_ts)
+                      : 0;
+    }
     sqlite3_int64 prev_after = has_newer ? first_id : 0;
     sqlite3_int64 next_before = has_older ? last_id : 0;
     mg_http_printf_chunk(
@@ -1485,6 +1640,25 @@ static void sse_send_cached_events(struct app_state *state, struct mg_connection
       state->cfg.sse_cache_limit > 0 ? (size_t)state->cfg.sse_cache_limit : state->store.count;
   if (requested > 0 && (size_t)requested < limit) limit = (size_t)requested;
   if (limit > 0 && to_send > limit) to_send = limit;
+  size_t remaining_bytes = state->store.count && c->send.len < SSE_CLIENT_MAX_PENDING_BYTES
+                               ? SSE_CLIENT_MAX_PENDING_BYTES - c->send.len
+                               : 0;
+  size_t replay_count = 0;
+  while (replay_count < to_send) {
+    size_t offset = replay_count;
+    size_t idx = (state->store.head + state->store.max - 1 - offset) % state->store.max;
+    const char *json = state->store.items[idx].json;
+    size_t json_len = json ? strlen(json) : 0;
+    if (json_len > SIZE_MAX - 8 - SSE_CHUNK_OVERHEAD) break;
+    size_t frame_size = json_len + 8 + SSE_CHUNK_OVERHEAD;
+    if (frame_size > remaining_bytes) break;
+    remaining_bytes -= frame_size;
+    replay_count++;
+  }
+  if (replay_count < to_send) {
+    app_log(LOG_LEVEL_DEBUG, "SSE", "Replay limitato a %zu eventi per il limite di output", replay_count);
+    to_send = replay_count;
+  }
   app_log(LOG_LEVEL_DEBUG, "SSE", "Invio %zu eventi cached al nuovo client (limit %d)", to_send,
           state->cfg.sse_cache_limit);
   for (size_t i = to_send; i > 0; --i) {
@@ -1506,10 +1680,9 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data) {
   struct app_state *state = (struct app_state *)c->fn_data;
   if (!state && c->mgr) state = (struct app_state *)c->mgr->userdata;
   static struct mg_http_serve_opts opts;
-  if (opts.root_dir == NULL && opts.extra_headers == NULL) {
-    opts.root_dir = "web";
-    opts.extra_headers = k_static_extra_headers;
-  }
+  /* Serve the configured UI root, defaulting to the bundled web/ directory. */
+  opts.root_dir = state ? state->cfg.web_root : "web";
+  opts.extra_headers = k_static_extra_headers;
 
   switch (ev) {
     case MG_EV_HTTP_MSG: {
@@ -1801,8 +1974,9 @@ int main(void) {
   mg_timer_init(&http_mgr.timers, &ping_timer, 5000, MG_TIMER_REPEAT, send_sse_ping, &state);
   int sse_backlog = 0;
   for (;;) {
-    /* Don't sleep while SSE events are still queued after a bounded flush.  */
-    mg_mgr_poll(&http_mgr, sse_backlog ? 0 : 100);
+    /* A 1 ms wait avoids a busy loop under sustained SSE backlog while keeping
+       socket and timer handling responsive.  */
+    mg_mgr_poll(&http_mgr, sse_backlog ? 1 : 100);
     sse_backlog = flush_sse_queue(&state);
   }
 

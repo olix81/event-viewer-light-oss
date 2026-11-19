@@ -79,7 +79,14 @@ def publish_events(
     try:
         for idx, payload in enumerate(events, start=1):
             print(f"[{idx}] Publishing to {topic}: {payload}")
-            client.publish(topic, payload, qos=0, retain=False)
+            info = client.publish(topic, payload, qos=0, retain=False)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError(
+                    f"Unable to queue event {idx}: {mqtt.error_string(info.rc)}"
+                )
+            info.wait_for_publish(timeout=30)
+            if not info.is_published():
+                raise TimeoutError(f"Timed out publishing event {idx}")
             time.sleep(delay)
     finally:
         client.loop_stop()
