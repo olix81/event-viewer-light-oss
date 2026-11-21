@@ -18,10 +18,14 @@ Il formato segue [Keep a Changelog](https://keepachangelog.com/it-IT/1.1.0/) e i
 - README riscritto e allineato all'uso di Mongoose per HTTP e MQTT.
 - SQLite in modalità WAL con `synchronous=NORMAL`: niente fsync a ogni insert e letture HTTP non bloccate dalle scritture MQTT. Rimosso l'indice inutilizzato `idx_events_received_at`.
 - Gli eventi SSE vengono inoltrati subito (`mg_wakeup`) invece di attendere fino a 100 ms il timeout del loop HTTP.
-- La UI d'esempio apre lo stream in parallelo alla cronologia, con `?replay=0`.
+- Coda SSE limitata a 1024 eventi/8 MiB e output in attesa per client a 4 MiB; in caso di sovraccarico gli stream vengono chiusi per riconnessione e replay. Il loop HTTP attende 1 ms con arretrato per evitare busy-spin.
+- La UI d'esempio usa il replay SSE predefinito per recuperare gli eventi recenti dopo una riconnessione, deduplicando quelli già caricati dalla cronologia.
+- La cartella dei file statici è configurabile con `WEB_ROOT`; il default resta `web/`.
 
 ### Fixed
+- `GET /api/events?after_id=N` restituiva gli eventi più recenti in assoluto invece della pagina adiacente più nuova di `N`. Inoltre `has_newer`/`prev_after_id` erano sempre `false`/`0` navigando con `before_id`, e `has_older` era errato con `after_id`.
 - La UI d'esempio mostrava gli eventi del replay SSE sopra quelli più recenti e, al superamento di 200 righe, scartava proprio gli ultimi eventi.
+- `publish_samples.py` poteva terminare prima che il loop di rete MQTT avesse completato l'invio; ora verifica ogni pubblicazione e segnala eventuali errori o timeout.
 
 ## [0.2.0] - 2026-03-15
 ### Added

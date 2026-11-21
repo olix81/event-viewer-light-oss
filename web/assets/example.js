@@ -19,9 +19,8 @@
   let historyReady = false;  // finche' la cronologia non e' arrivata...
   const pendingLive = [];    // ...gli eventi live vengono messi da parte qui
 
-  /* Lo stream e' aperto con ?replay=0 (niente reinvio della cache), ma un
-     evento live arrivato mentre si carica la cronologia puo' comparire in
-     entrambe: lo riconosciamo con una chiave e lo scartiamo. */
+  /* Gli eventi del replay SSE possono sovrapporsi alla cronologia HTTP o a
+     replay successivi dopo una riconnessione: li deduplichiamo con una chiave. */
   function eventKey(evt) {
     const d = evt.event_data || {};
     return [evt.timestamp, d.src, d.type, d.id, d.timestamp].join("|");
@@ -139,8 +138,8 @@
   }
 
   function openStream() {
-    // replay=0: la cronologia arriva gia' da /api/events.
-    const source = new EventSource("/stream?replay=0");
+    // Il replay predefinito recupera gli eventi recenti dopo una riconnessione.
+    const source = new EventSource("/stream");
     source.onopen = function () { setBadge("sse-status", "attivo", "ok"); };
     source.onerror = function () { setBadge("sse-status", "riconnessione...", "warn"); };
     source.onmessage = function (msg) {
